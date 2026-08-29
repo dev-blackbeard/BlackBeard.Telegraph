@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      net8.0 only. Every consumer this package is designed for (a console host publishing a
+      stream, a MAUI app subscribing to one) is already on net8.0 or a net8.0-<platform> TFM, so
+      there is no netstandard2.0 reach to preserve here the way there is for Argus.Core. Targeting
+      net8.0 only keeps System.Text.Json and IAsyncEnumerable in-box, with no extra package
+      references and no EnumeratorCancellationAttribute polyfill.
+    -->
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Telegraph</RootNamespace>
+    <AssemblyName>Telegraph</AssemblyName>
+    <IsPackable>true</IsPackable>
+    <PackageId>BlackBeard.Telegraph</PackageId>
+    <Description>A generic newline-delimited-JSON-over-TCP pub/sub transport. Not tied to any single data model; ships an opt-in Pose6Dof type and a generic string attribute map for 6DOF-plus-metadata use cases, but neither is required to use the transport.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" PrivateAssets="all" IncludeAssets="runtime; build; native; contentfiles; analyzers; buildtransitive" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AdditionalFiles Include="PublicAPI.Shipped.txt" />
+    <AdditionalFiles Include="PublicAPI.Unshipped.txt" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Telegraph.Tests" />
+  </ItemGroup>
+
+</Project>

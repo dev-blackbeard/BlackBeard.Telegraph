@@ -1,0 +1,17 @@
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+*.user
+*.suo
+
+artifacts/
+TestResults/
+*.trx
+coverage*.xml
+
+.vs/
+.vscode/
+.idea/
+*.swp
+.DS_Store
