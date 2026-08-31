@@ -1,0 +1,71 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version to publish, without the leading v'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write   # required for NuGet Trusted Publishing's OIDC token exchange
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  publish:
+    name: publish to nuget.org
+    runs-on: ubuntu-latest
+
+    # A deployment environment, so publishing needs whatever approval the repository's
+    # environment protection rules require. Publishing is the one irreversible step in this
+    # repository: a package version, once pushed, cannot be replaced.
+    environment: nuget
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # SourceLink needs history to resolve the commit.
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "value=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pack
+        shell: bash
+        run: scripts/pack-local --version "${{ steps.version.outputs.value }}" --configuration Release --clean
+
+      - name: Verify before publishing
+        run: dotnet test tests/Telegraph.Tests/Telegraph.Tests.csproj --configuration Release
+
+      # Trusted Publishing: exchanges this run's GitHub OIDC token for a short-lived
+      # (1-hour) nuget.org API key, matched against a policy configured on nuget.org
+      # (owner, repo, workflow file, environment). No long-lived secret stored here.
+      - name: NuGet login (OIDC -> short-lived key)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: blackbeard
+
+      - name: Push
+        run: |
+          dotnet nuget push "artifacts/local-feed/*.nupkg" \
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
