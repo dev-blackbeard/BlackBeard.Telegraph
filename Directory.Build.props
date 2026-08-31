@@ -70,6 +70,7 @@
     <Company></Company>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
     <PackageTags>transport;tcp;jsonl;streaming;pubsub</PackageTags>
     <Copyright>Copyright the Telegraph contributors</Copyright>
     <RepositoryType>git</RepositoryType>
@@ -89,6 +90,7 @@
 
   <ItemGroup Condition="'$(IsPackable)' == 'true'">
     <None Include="$(TelegraphRepoRoot)README.md" Pack="true" PackagePath="\" Visible="false" />
+    <None Include="$(TelegraphRepoRoot)icon.png" Pack="true" PackagePath="\" Visible="false" />
   </ItemGroup>
 
 </Project>
