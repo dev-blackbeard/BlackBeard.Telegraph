@@ -119,6 +119,61 @@ public sealed class RoundTripTests
         Assert.Equal("broadcast", secondRead.Result.EntityId);
     }
 
+    [Fact]
+    public async Task SubscribersExposesRemoteEndPointAndSentCounters()
+    {
+        using var publisher = new TelegraphPublisher(0);
+        await publisher.StartAsync();
+
+        using var subscriber = new TelegraphSubscriber("127.0.0.1", publisher.Port);
+        await subscriber.ConnectAsync();
+        await WaitForSubscriberCountAsync(publisher, 1);
+
+        System.Collections.Generic.IReadOnlyList<TelegraphSubscriberInfo> before = publisher.Subscribers;
+        Assert.Single(before);
+        Assert.Equal("127.0.0.1", before[0].RemoteEndPoint.Address.ToString());
+        Assert.Equal(0, before[0].MessagesSent);
+        Assert.Equal(0, before[0].BytesSent);
+        Assert.True(before[0].ConnectedAt <= DateTimeOffset.UtcNow);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        Task<TelegraphEnvelope> readTask = ReadOneAsync<TelegraphEnvelope>(subscriber, cts.Token);
+        publisher.Publish(new TelegraphEnvelope("counted", DateTimeOffset.UtcNow));
+        await readTask;
+
+        TelegraphSubscriberInfo after = Assert.Single(publisher.Subscribers);
+        Assert.Same(before[0], after);
+        Assert.Equal(1, after.MessagesSent);
+        Assert.True(after.BytesSent > 0);
+    }
+
+    [Fact]
+    public async Task DisconnectDropsOnlyTheGivenSubscriber()
+    {
+        using var publisher = new TelegraphPublisher(0);
+        await publisher.StartAsync();
+
+        using var first = new TelegraphSubscriber("127.0.0.1", publisher.Port);
+        using var second = new TelegraphSubscriber("127.0.0.1", publisher.Port);
+        await first.ConnectAsync();
+        await second.ConnectAsync();
+        await WaitForSubscriberCountAsync(publisher, 2);
+
+        TelegraphSubscriberInfo target = publisher.Subscribers[0];
+
+        Assert.True(publisher.Disconnect(target));
+        Assert.False(publisher.Disconnect(target));
+
+        DateTime deadline = DateTime.UtcNow.AddSeconds(10);
+        while (publisher.SubscriberCount != 1 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.Equal(1, publisher.SubscriberCount);
+        Assert.DoesNotContain(target, publisher.Subscribers);
+    }
+
     private static async Task<T> ReadOneAsync<T>(TelegraphSubscriber subscriber, CancellationToken cancellationToken)
     {
         await foreach (T message in subscriber.ReadAsync<T>(cancellationToken))
