@@ -14,11 +14,18 @@ public enum TelegraphBackpressurePolicy
     BlockUntilDrained,
 
     /// <summary>
-    /// A subscriber that is not immediately ready to receive is skipped for this message rather
-    /// than blocking the call to <see cref="TelegraphPublisher.Publish{T}(T)"/>; it stays
-    /// connected and may receive later messages normally. Use this when one slow subscriber must
-    /// never add latency to delivery for the others, and missing an occasional message is
-    /// acceptable for that subscriber.
+    /// Before writing, a quick, non-blocking check rules out a subscriber whose socket cannot
+    /// accept any bytes at all right now; a subscriber that fails the check is skipped for this
+    /// message rather than blocking the call to <see cref="TelegraphPublisher.Publish{T}(T)"/>,
+    /// and stays connected to receive later messages normally. The check only proves the buffer
+    /// isn't <em>completely</em> full, not that the whole message will fit -- writes are never
+    /// split across messages (splitting one would corrupt the newline-delimited wire format for a
+    /// subscriber that is meant to stay connected), so a subscriber with a nearly-full buffer can
+    /// still pass the check and then block this call for however long that one write takes. Use
+    /// this when missing an occasional message is acceptable for a slow subscriber and most of
+    /// the time it should not add latency for the others; use
+    /// <see cref="DisconnectAfterTimeout"/> instead if a hard bound on blocking time matters more
+    /// than keeping that subscriber connected.
     /// </summary>
     DropForSlowSubscriber,
 

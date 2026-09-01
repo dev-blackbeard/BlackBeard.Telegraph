@@ -104,11 +104,12 @@ public sealed class TelegraphPublisher : IDisposable
     /// is <see cref="TelegraphBackpressurePolicy.BlockUntilDrained"/>), a subscriber whose socket
     /// buffer is full blocks this call until it drains or the write fails. Set
     /// <see cref="BackpressurePolicy"/> to change that: <see cref="TelegraphBackpressurePolicy.DropForSlowSubscriber"/>
-    /// skips a subscriber that is not immediately ready rather than blocking, and
-    /// <see cref="TelegraphBackpressurePolicy.DisconnectAfterTimeout"/> bounds how long a write may
-    /// block before that subscriber is disconnected. A subscriber whose write throws (connection
-    /// reset, buffer full past the policy's timeout) is dropped silently rather than taking every
-    /// other subscriber down with it.
+    /// skips a subscriber whose buffer is already completely full rather than blocking, which
+    /// greatly reduces but does not eliminate the chance of this call blocking on it (see the
+    /// policy's own remarks), and <see cref="TelegraphBackpressurePolicy.DisconnectAfterTimeout"/>
+    /// bounds how long a write may block before that subscriber is disconnected. A subscriber
+    /// whose write throws (connection reset, buffer full past the policy's timeout) is dropped
+    /// silently rather than taking every other subscriber down with it.
     /// </remarks>
     public void Publish<T>(T message)
     {
@@ -131,10 +132,13 @@ public sealed class TelegraphPublisher : IDisposable
                     continue;
                 }
 
-                if (BackpressurePolicy == TelegraphBackpressurePolicy.DisconnectAfterTimeout)
-                {
-                    client.Client.SendTimeout = (int)Math.Clamp(BackpressureTimeout.TotalMilliseconds, 1, int.MaxValue);
-                }
+                // Set explicitly on every write, for every policy -- not only when entering
+                // DisconnectAfterTimeout -- so a socket that had a finite SendTimeout from an
+                // earlier policy gets it reset back to 0 (infinite) as soon as BackpressurePolicy
+                // changes away from DisconnectAfterTimeout, rather than keeping a stale timeout.
+                client.Client.SendTimeout = BackpressurePolicy == TelegraphBackpressurePolicy.DisconnectAfterTimeout
+                    ? (int)Math.Clamp(BackpressureTimeout.TotalMilliseconds, 1, int.MaxValue)
+                    : 0;
 
                 NetworkStream stream = client.GetStream();
                 stream.Write(bytes, 0, bytes.Length);

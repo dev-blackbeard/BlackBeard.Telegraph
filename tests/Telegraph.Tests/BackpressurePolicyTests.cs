@@ -86,6 +86,54 @@ public sealed class BackpressurePolicyTests
         Assert.Equal(0, publisher.SubscriberCount);
     }
 
+    [Fact]
+    public async Task SwitchingBackToBlockUntilDrainedResetsAPreviouslySetSendTimeout()
+    {
+        using var publisher = new TelegraphPublisher(0)
+        {
+            BackpressurePolicy = TelegraphBackpressurePolicy.DisconnectAfterTimeout,
+            BackpressureTimeout = TimeSpan.FromMilliseconds(150),
+        };
+        await publisher.StartAsync();
+
+        using var slow = new TcpClient { ReceiveBufferSize = 1024 };
+        await slow.ConnectAsync(IPAddress.Loopback, publisher.Port);
+        await WaitForSubscriberCountAsync(publisher, 1);
+
+        // One small write under DisconnectAfterTimeout, well under the receive buffer, so it
+        // succeeds immediately but still sets a finite SendTimeout on the accepted socket.
+        publisher.Publish(new { Filler = "priming" });
+        Assert.Equal(1, publisher.SubscriberCount);
+
+        // Switch back to the default policy before the buffer fills.
+        publisher.BackpressurePolicy = TelegraphBackpressurePolicy.BlockUntilDrained;
+
+        // Flood the never-read subscriber past what its buffer can hold. If the earlier finite
+        // SendTimeout was left in place (the bug), this blocking write times out and the
+        // subscriber is disconnected well within 150ms. If it was reset to infinite (the fix),
+        // the write instead blocks for as long as it takes -- i.e. still going after a window
+        // many times that 150ms.
+        string filler = new string('x', 8192);
+        Task floodTask = Task.Run(() =>
+        {
+            for (int i = 0; i < 200; i++)
+            {
+                publisher.Publish(new { Filler = filler });
+            }
+        });
+
+        await Task.Delay(1000);
+
+        Assert.False(floodTask.IsCompleted, "Publish should still be blocked on the slow subscriber under BlockUntilDrained, not disconnecting it via a stale SendTimeout.");
+        Assert.Equal(1, publisher.SubscriberCount);
+
+        // Unblock the flood before the test exits, rather than leaving it to finish in the
+        // background after this method returns: disposing the publisher tears down the socket,
+        // which fails the in-flight write and lets the loop drain against an empty client list.
+        publisher.Dispose();
+        await floodTask;
+    }
+
     private static async Task<T> ReadOneAsync<T>(TelegraphSubscriber subscriber, CancellationToken cancellationToken)
     {
         await foreach (T message in subscriber.ReadAsync<T>(cancellationToken))
