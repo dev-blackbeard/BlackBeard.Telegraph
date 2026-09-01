@@ -183,9 +183,16 @@ public sealed class TelegraphPublisher : IDisposable
                 if (ReferenceEquals(candidate.Info, subscriber))
                 {
                     match = candidate;
-                    _clients.Remove(candidate);
                     break;
                 }
+            }
+
+            // Removed after the loop, not inside it -- mutating _clients mid-enumeration only
+            // happened to be safe here because the break on the line above meant MoveNext() was
+            // never called again; find-then-remove doesn't depend on that.
+            if (match != null)
+            {
+                _clients.Remove(match);
             }
         }
 
@@ -220,10 +227,27 @@ public sealed class TelegraphPublisher : IDisposable
                 break;
             }
 
-            var info = new TelegraphSubscriberInfo((IPEndPoint)client.Client.RemoteEndPoint!, DateTimeOffset.UtcNow);
-            lock (_clientsGate)
+            // A client that connects and drops immediately (a port scanner, a health check, a
+            // load-balancer probe) can make RemoteEndPoint throw on the now-defunct socket. That
+            // must not escape this loop -- an unhandled exception here would fault AcceptLoopAsync
+            // and permanently stop the publisher from accepting any further subscribers, with
+            // nothing surfaced anywhere. Treat it the same as any other subscriber that never made
+            // it: skip it and keep accepting.
+            try
             {
-                _clients.Add(new ConnectedSubscriber(client, info));
+                var info = new TelegraphSubscriberInfo((IPEndPoint)client.Client.RemoteEndPoint!, DateTimeOffset.UtcNow);
+                lock (_clientsGate)
+                {
+                    _clients.Add(new ConnectedSubscriber(client, info));
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                client.Dispose();
+            }
+            catch (SocketException)
+            {
+                client.Dispose();
             }
         }
     }

@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
@@ -172,6 +174,42 @@ public sealed class RoundTripTests
 
         Assert.Equal(1, publisher.SubscriberCount);
         Assert.DoesNotContain(target, publisher.Subscribers);
+    }
+
+    [Fact]
+    public async Task AcceptLoopSurvivesAClientThatDisconnectsBeforeItCanBeInspected()
+    {
+        using var publisher = new TelegraphPublisher(0);
+        await publisher.StartAsync();
+
+        // A client that connects and drops immediately, the way a port scanner, health check, or
+        // load-balancer probe would. Before the fix this could throw while the accept loop
+        // inspected the socket's RemoteEndPoint, permanently killing the loop.
+        using (var probe = new TcpClient())
+        {
+            await probe.ConnectAsync(IPAddress.Loopback, publisher.Port);
+        }
+
+        using var subscriber = new TelegraphSubscriber("127.0.0.1", publisher.Port);
+        await subscriber.ConnectAsync();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        Task<TelegraphEnvelope> readTask = ReadOneAsync<TelegraphEnvelope>(subscriber, cts.Token);
+
+        // Whether the probe's RemoteEndPoint access actually threw is a timing-dependent race, so
+        // rather than waiting on a specific SubscriberCount (which the probe itself may or may not
+        // still occupy), republish until the real subscriber -- once the accept loop has gotten to
+        // it -- actually receives its message. If the loop died on the probe, this never resolves
+        // and the test times out via the token above instead of hanging forever.
+        var target = new TelegraphEnvelope("after-probe", DateTimeOffset.UtcNow);
+        while (!readTask.IsCompleted && !cts.IsCancellationRequested)
+        {
+            publisher.Publish(target);
+            await Task.Delay(20);
+        }
+
+        TelegraphEnvelope received = await readTask;
+        Assert.Equal("after-probe", received.EntityId);
     }
 
     private static async Task<T> ReadOneAsync<T>(TelegraphSubscriber subscriber, CancellationToken cancellationToken)
