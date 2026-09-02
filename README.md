@@ -42,6 +42,27 @@ Newline-delimited UTF-8 JSON: one message per line, on a plain TCP stream. No fr
 newline, no handshake, no compression. Inspectable with `nc localhost 5000`. A late-connecting
 subscriber only sees messages published after it connects — there is no replay buffer.
 
+## TLS
+
+Plaintext by default, matching the `nc`-inspectable quick start above. For anything crossing a
+network boundary that isn't already trusted, pass `SslServerAuthenticationOptions`/
+`SslClientAuthenticationOptions` to the publisher/subscriber constructors instead:
+
+```csharp
+using var publisher = new TelegraphPublisher(5000, new SslServerAuthenticationOptions
+{
+    ServerCertificate = myCertificate,
+});
+
+using var subscriber = new TelegraphSubscriber("localhost", 5000, new SslClientAuthenticationOptions
+{
+    TargetHost = "localhost",
+});
+```
+
+A connection that fails the handshake is dropped before it is ever added to the broadcast list —
+it never receives a partial message and never counts toward `SubscriberCount`.
+
 ## `Pose6Dof` and `TelegraphEnvelope`
 
 An opt-in message shape for 6DOF-plus-metadata streams, so that use case doesn't require designing
