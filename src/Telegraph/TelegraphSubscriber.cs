@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
+using System.Security.Authentication;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -22,6 +24,8 @@ namespace Telegraph;
 /// </remarks>
 public sealed class TelegraphSubscriber : IDisposable
 {
+    private const int NonceSize = 32;
+
     private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
     {
         PropertyNameCaseInsensitive = true,
@@ -29,6 +33,7 @@ public sealed class TelegraphSubscriber : IDisposable
 
     private readonly string _host;
     private readonly int _port;
+    private readonly byte[]? _sharedSecret;
     private TcpClient? _client;
     private StreamReader? _reader;
     private bool _disposed;
@@ -48,6 +53,34 @@ public sealed class TelegraphSubscriber : IDisposable
         _port = port;
     }
 
+    /// <summary>Creates a subscriber that completes a pre-shared-key handshake on connect.</summary>
+    /// <param name="host">The publisher's host name or address.</param>
+    /// <param name="port">The publisher's port.</param>
+    /// <param name="sharedSecret">
+    /// The secret this subscriber and the <see cref="TelegraphPublisher"/> it connects to must
+    /// agree on out of band. Must not be null or empty.
+    /// </param>
+    /// <exception cref="ArgumentNullException"><paramref name="host"/> is <c>null</c>.</exception>
+    /// <exception cref="ArgumentException"><paramref name="sharedSecret"/> is null or empty.</exception>
+    /// <remarks>
+    /// See the remarks on <see cref="TelegraphPublisher(int, string)"/> for the handshake this
+    /// performs, and what it does and does not protect against. If the secret this subscriber was
+    /// constructed with doesn't match the publisher's, the publisher closes the connection as soon
+    /// as it sees the mismatched response -- there is no explicit rejection message, so this
+    /// surfaces as the connection appearing closed the moment <see cref="ReadAsync{T}(CancellationToken)"/>
+    /// is used, the same as it would for any other reason the publisher might close it.
+    /// </remarks>
+    public TelegraphSubscriber(string host, int port, string sharedSecret)
+        : this(host, port)
+    {
+        if (string.IsNullOrEmpty(sharedSecret))
+        {
+            throw new ArgumentException("Shared secret must not be null or empty.", nameof(sharedSecret));
+        }
+
+        _sharedSecret = Encoding.UTF8.GetBytes(sharedSecret);
+    }
+
     /// <summary><c>true</c> once <see cref="ConnectAsync(CancellationToken)"/> has completed successfully.</summary>
     public bool IsConnected
     {
@@ -55,14 +88,39 @@ public sealed class TelegraphSubscriber : IDisposable
     }
 
     /// <summary>Opens the connection to the publisher.</summary>
-    /// <param name="cancellationToken">Cancels the connection attempt.</param>
+    /// <param name="cancellationToken">Cancels the connection attempt, and the pre-shared-key handshake if one is required.</param>
+    /// <exception cref="AuthenticationException">
+    /// A shared secret was configured, but the publisher closed the connection before sending its
+    /// nonce.
+    /// </exception>
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
         var client = new TcpClient();
         await client.ConnectAsync(_host, _port, cancellationToken).ConfigureAwait(false);
 
+        NetworkStream stream = client.GetStream();
+
+        if (_sharedSecret != null)
+        {
+            var nonce = new byte[NonceSize];
+            bool gotNonce = await ReadFullyAsync(stream, nonce, nonce.Length, cancellationToken).ConfigureAwait(false);
+            if (!gotNonce)
+            {
+                client.Dispose();
+                throw new AuthenticationException("The publisher closed the connection before completing the pre-shared-key handshake.");
+            }
+
+            byte[] response;
+            using (var hmac = new HMACSHA256(_sharedSecret))
+            {
+                response = hmac.ComputeHash(nonce);
+            }
+
+            await stream.WriteAsync(response, cancellationToken).ConfigureAwait(false);
+        }
+
         _client = client;
-        _reader = new StreamReader(client.GetStream(), Encoding.UTF8);
+        _reader = new StreamReader(stream, Encoding.UTF8);
     }
 
     /// <summary>
@@ -121,5 +179,22 @@ public sealed class TelegraphSubscriber : IDisposable
         _disposed = true;
         _reader?.Dispose();
         _client?.Dispose();
+    }
+
+    private static async Task<bool> ReadFullyAsync(Stream stream, byte[] buffer, int count, CancellationToken cancellationToken)
+    {
+        int offset = 0;
+        while (offset < count)
+        {
+            int read = await stream.ReadAsync(buffer.AsMemory(offset, count - offset), cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+            {
+                return false;
+            }
+
+            offset += read;
+        }
+
+        return true;
     }
 }

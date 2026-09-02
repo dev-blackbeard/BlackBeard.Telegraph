@@ -42,6 +42,21 @@ Newline-delimited UTF-8 JSON: one message per line, on a plain TCP stream. No fr
 newline, no handshake, no compression. Inspectable with `nc localhost 5000`. A late-connecting
 subscriber only sees messages published after it connects — there is no replay buffer.
 
+## Pre-shared-key handshake
+
+Open to any connection by default. For "don't let an arbitrary process on this host or LAN
+subscribe to my stream" without provisioning PKI, pass a shared secret to both constructors:
+
+```csharp
+using var publisher = new TelegraphPublisher(5000, "correct-horse-battery-staple");
+using var subscriber = new TelegraphSubscriber("localhost", 5000, "correct-horse-battery-staple");
+```
+
+The subscriber proves it knows the secret (a keyed hash of a publisher-issued nonce) before it's
+added to the broadcast list; a mismatch closes the connection immediately, before any application
+data is exchanged. This authenticates the connection, not the transport — the stream itself stays
+plaintext, so it is not a substitute for TLS where the network itself isn't trusted.
+
 ## `Pose6Dof` and `TelegraphEnvelope`
 
 An opt-in message shape for 6DOF-plus-metadata streams, so that use case doesn't require designing
