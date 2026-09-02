@@ -42,6 +42,23 @@ Newline-delimited UTF-8 JSON: one message per line, on a plain TCP stream. No fr
 newline, no handshake, no compression. Inspectable with `nc localhost 5000`. A late-connecting
 subscriber only sees messages published after it connects — there is no replay buffer.
 
+## CIDR allow-list
+
+Accepts a connection from any address by default. For "only this /24 may subscribe" without
+standing up firewall rules per-process, add to `AllowedRanges`:
+
+```csharp
+using var publisher = new TelegraphPublisher(5000)
+{
+    AllowedRanges = { IPNetwork.Parse("10.0.0.0/24") },
+};
+```
+
+A connection from outside every configured range is closed immediately after being accepted,
+before it's added to the broadcast list — it never receives a partial message and never counts
+toward `SubscriberCount`. Populate it before calling `StartAsync`; it's read without
+synchronisation while the accept loop is running.
+
 ## `Pose6Dof` and `TelegraphEnvelope`
 
 An opt-in message shape for 6DOF-plus-metadata streams, so that use case doesn't require designing

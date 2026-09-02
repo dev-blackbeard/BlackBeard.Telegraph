@@ -29,6 +29,13 @@ namespace Telegraph;
 /// <see cref="Publish{T}(T)"/> block for every other subscriber; see the write-timeout behaviour
 /// in the remarks on <see cref="Publish{T}(T)"/>.
 /// </para>
+/// <para>
+/// Accepts a connection from any address by default. Add to <see cref="AllowedRanges"/> -- before
+/// <see cref="StartAsync(CancellationToken)"/>, since it is read without synchronisation while the
+/// accept loop is running -- to restrict that: a connection from outside every configured range is
+/// closed immediately after being accepted, before it is added to the broadcast list, so it never
+/// receives a partial message and never counts toward <see cref="SubscriberCount"/>.
+/// </para>
 /// </remarks>
 public sealed class TelegraphPublisher : IDisposable
 {
@@ -56,6 +63,15 @@ public sealed class TelegraphPublisher : IDisposable
     {
         get { return ((IPEndPoint)_listener.LocalEndpoint).Port; }
     }
+
+    /// <summary>
+    /// CIDR ranges a connection's remote address must fall within to be accepted. Empty (the
+    /// default) means no restriction, matching the behaviour of every <see cref="TelegraphPublisher"/>
+    /// before this property existed. Populate it (e.g. via an object initializer) before calling
+    /// <see cref="StartAsync(CancellationToken)"/> -- the accept loop reads it without taking a
+    /// lock, so mutating it concurrently with a running loop is not supported.
+    /// </summary>
+    public ICollection<IPNetwork> AllowedRanges { get; } = new List<IPNetwork>();
 
     /// <summary>How many subscribers are currently connected.</summary>
     public int SubscriberCount
@@ -165,11 +181,53 @@ public sealed class TelegraphPublisher : IDisposable
                 break;
             }
 
+            bool allowed;
+            try
+            {
+                allowed = IsAllowed(client);
+            }
+            catch (ObjectDisposedException)
+            {
+                // The connection dropped between being accepted and being checked (a port
+                // scanner, a health check, a load-balancer probe) -- treat it the same as a
+                // disallowed one rather than letting it escape and kill the accept loop.
+                allowed = false;
+            }
+            catch (SocketException)
+            {
+                allowed = false;
+            }
+
+            if (!allowed)
+            {
+                client.Dispose();
+                continue;
+            }
+
             lock (_clientsGate)
             {
                 _clients.Add(client);
             }
         }
+    }
+
+    private bool IsAllowed(TcpClient client)
+    {
+        if (AllowedRanges.Count == 0)
+        {
+            return true;
+        }
+
+        var remoteEndPoint = (IPEndPoint)client.Client.RemoteEndPoint!;
+        foreach (IPNetwork range in AllowedRanges)
+        {
+            if (range.Contains(remoteEndPoint.Address))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>Stops listening, disconnects every subscriber, and releases the port.</summary>
