@@ -34,10 +34,15 @@ namespace Telegraph;
 /// <para>
 /// The connection is plaintext by default -- the right trade-off for the zero-setup, <c>nc</c>-inspectable
 /// quick start. Pass <see cref="SslServerAuthenticationOptions"/> to the constructor to require
-/// TLS instead: a connection that fails the handshake is dropped before it is ever added to the
-/// broadcast list, so it never receives a partial message and never counts toward
-/// <see cref="SubscriberCount"/>, and one slow or stalled handshake cannot hold up accepting
-/// anyone else.
+/// TLS instead: a connection whose handshake this publisher's own <c>AuthenticateAsServerAsync</c>
+/// step rejects (a protocol/cipher mismatch, a required client certificate that's missing) is
+/// dropped before it is ever added to the broadcast list, so it never receives a partial message
+/// and never counts toward <see cref="SubscriberCount"/>. A subscriber that locally distrusts this
+/// publisher's certificate is different: that handshake step can still complete on this side,
+/// since trust is the client's own decision and there's no protocol-level step where it reports
+/// that back -- that connection is cleaned up the same way any other dead one is, the next time
+/// <see cref="Publish{T}(T)"/> tries to write to it and fails. Either way, one slow or stalled
+/// handshake cannot hold up accepting anyone else.
 /// </para>
 /// </remarks>
 public sealed class TelegraphPublisher : IDisposable
@@ -65,8 +70,9 @@ public sealed class TelegraphPublisher : IDisposable
     /// <summary>Creates a publisher bound to a local port, requiring TLS on every connection.</summary>
     /// <param name="port">The TCP port to listen on. Pass <c>0</c> to let the OS choose one; read it back from <see cref="Port"/> after <see cref="StartAsync(CancellationToken)"/>.</param>
     /// <param name="sslOptions">
-    /// Server-side TLS options (certificate, protocols, client-certificate requirements). Every
-    /// connection must complete this handshake before it is added to the broadcast list.
+    /// Server-side TLS options (certificate, protocols, client-certificate requirements). See the
+    /// remarks on <see cref="TelegraphPublisher"/> for exactly what completing this handshake
+    /// does and doesn't guarantee before a connection joins the broadcast list.
     /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="sslOptions"/> is <c>null</c>.</exception>
     public TelegraphPublisher(int port, SslServerAuthenticationOptions sslOptions)

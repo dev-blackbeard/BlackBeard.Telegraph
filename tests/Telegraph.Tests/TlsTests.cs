@@ -12,7 +12,8 @@ namespace Telegraph.Tests;
 /// <summary>
 /// Proves TLS round-trips over real loopback TCP when both ends opt in, that it is genuinely
 /// enforced (a client that doesn't trust the server certificate cannot connect), and that a
-/// connection which fails the handshake never counts as a subscriber.
+/// connection whose handshake the publisher's own AuthenticateAsServerAsync step rejects never
+/// counts as a subscriber.
 /// </summary>
 public sealed class TlsTests
 {
@@ -65,9 +66,40 @@ public sealed class TlsTests
         using var subscriber = new TelegraphSubscriber("127.0.0.1", publisher.Port, clientOptions);
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
 
+        // Distrust is the client's own local decision -- the publisher's own handshake step has
+        // no visibility into it and can genuinely complete on its side regardless (see the
+        // remarks on TelegraphPublisher), so this only asserts the client's own outcome.
         await Assert.ThrowsAnyAsync<AuthenticationException>(() => subscriber.ConnectAsync(cts.Token));
+    }
 
-        // The failed handshake must never have made it into the broadcast list.
+    [Fact]
+    public async Task AConnectionThatFailsTheServersOwnHandshakeStepIsNeverAddedAsASubscriber()
+    {
+        using X509Certificate2 certificate = CreateSelfSignedCertificate();
+
+        using var publisher = new TelegraphPublisher(0, new SslServerAuthenticationOptions
+        {
+            ServerCertificate = certificate,
+            EnabledSslProtocols = SslProtocols.Tls12,
+        });
+        await publisher.StartAsync();
+
+        var clientOptions = new SslClientAuthenticationOptions
+        {
+            TargetHost = "localhost",
+            RemoteCertificateValidationCallback = (_, cert, _, _) =>
+                cert != null && cert.GetCertHashString() == certificate.GetCertHashString(),
+            EnabledSslProtocols = SslProtocols.Tls13,
+        };
+
+        using var subscriber = new TelegraphSubscriber("127.0.0.1", publisher.Port, clientOptions);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+
+        // No overlap between what either side will negotiate -- a failure the publisher's own
+        // AuthenticateAsServerAsync detects during the handshake itself, unlike a client's later,
+        // local certificate-trust decision.
+        await Assert.ThrowsAnyAsync<Exception>(() => subscriber.ConnectAsync(cts.Token));
+
         Assert.Equal(0, publisher.SubscriberCount);
     }
 

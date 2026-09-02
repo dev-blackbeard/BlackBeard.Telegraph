@@ -60,8 +60,14 @@ using var subscriber = new TelegraphSubscriber("localhost", 5000, new SslClientA
 });
 ```
 
-A connection that fails the handshake is dropped before it is ever added to the broadcast list —
-it never receives a partial message and never counts toward `SubscriberCount`.
+A connection whose handshake the publisher's own `AuthenticateAsServerAsync` step rejects (a
+protocol/cipher mismatch, a required client certificate that's missing) is dropped before it is
+ever added to the broadcast list, so it never receives a partial message and never counts toward
+`SubscriberCount`. A subscriber that locally distrusts the publisher's certificate is a different
+case: from the publisher's side that handshake step can still complete, since trust is the
+client's own decision to make and there's no protocol-level step where it reports that decision
+back — that connection is cleaned up the same way any other dead one is, the next time `Publish`
+tries to write to it and fails.
 
 ## `Pose6Dof` and `TelegraphEnvelope`
 
