@@ -42,6 +42,12 @@ Newline-delimited UTF-8 JSON: one message per line, on a plain TCP stream. No fr
 newline, no handshake, no compression. Inspectable with `nc localhost 5000`. A late-connecting
 subscriber only sees messages published after it connects — there is no replay buffer.
 
+This is the default (`TelegraphFraming.NewlineDelimited`), not the only option. If a message's
+JSON could ever contain a raw newline byte, pass `TelegraphFraming.LengthPrefixed` to both the
+publisher and subscriber constructors instead: a 4-byte big-endian length prefix ahead of each
+message rather than a trailing `\n`. It gives up `nc`-inspectability for immunity to that failure
+mode — pick whichever trade-off fits.
+
 ## CIDR allow-list
 
 Accepts a connection from any address by default. For "only this /24 may subscribe" without
@@ -58,6 +64,30 @@ A connection from outside every configured range is closed immediately after bei
 before it's added to the broadcast list — it never receives a partial message and never counts
 toward `SubscriberCount`. Populate it before calling `StartAsync`; it's read without
 synchronisation while the accept loop is running.
+
+## UDP transport
+
+For high-rate telemetry where a dropped packet beats head-of-line blocking, or a subscriber that
+only cares about the latest value: `TelegraphUdpPublisher`/`TelegraphUdpSubscriber` sit next to
+the TCP pair above, not in place of them.
+
+```csharp
+using var publisher = new TelegraphUdpPublisher(5000);
+await publisher.StartAsync();
+publisher.Publish(new { Message = "hello" });
+
+using var subscriber = new TelegraphUdpSubscriber("localhost", 5000);
+await subscriber.ConnectAsync();
+await foreach (var item in subscriber.ReadAsync<MyMessageType>())
+{
+    // ...
+}
+```
+
+One JSON object per datagram — UDP already delivers message boundaries, so there's no newline
+framing to worry about. No reliability, ordering, or delivery guarantees of any kind; that's the
+trade for reaching past TCP. A message over roughly 1472 bytes (`TelegraphUdpPublisher.MaxDatagramSize`)
+throws on `Publish` instead of being silently fragmented by the OS.
 
 ## `Pose6Dof` and `TelegraphEnvelope`
 
