@@ -100,6 +100,20 @@ public sealed class TelegraphPublisher : IDisposable
         }
     }
 
+    /// <summary>
+    /// How a subscriber whose write would otherwise block is treated by
+    /// <see cref="Publish{T}(T)"/>. Defaults to <see cref="TelegraphBackpressurePolicy.BlockUntilDrained"/>,
+    /// the behaviour every <see cref="TelegraphPublisher"/> had before this property existed.
+    /// </summary>
+    public TelegraphBackpressurePolicy BackpressurePolicy { get; set; } = TelegraphBackpressurePolicy.BlockUntilDrained;
+
+    /// <summary>
+    /// How long a write may block before the subscriber is disconnected, when
+    /// <see cref="BackpressurePolicy"/> is <see cref="TelegraphBackpressurePolicy.DisconnectAfterTimeout"/>.
+    /// Ignored for every other policy. Defaults to 30 seconds.
+    /// </summary>
+    public TimeSpan BackpressureTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
     /// <summary>Starts listening for subscribers.</summary>
     /// <param name="cancellationToken">Stops accepting new subscribers when cancelled. Already-connected subscribers are unaffected.</param>
     public Task StartAsync(CancellationToken cancellationToken = default)
@@ -117,10 +131,16 @@ public sealed class TelegraphPublisher : IDisposable
     /// <typeparam name="T">The message type. Any type <see cref="JsonSerializer"/> can serialise.</typeparam>
     /// <param name="message">The message.</param>
     /// <remarks>
-    /// Writes synchronously and best-effort per subscriber: a subscriber whose socket buffer is
-    /// full blocks this call until it drains or the write fails. A subscriber whose write throws
-    /// (connection reset, buffer full past the OS timeout) is dropped silently rather than taking
-    /// every other subscriber down with it.
+    /// Writes synchronously and best-effort per subscriber: by default (<see cref="BackpressurePolicy"/>
+    /// is <see cref="TelegraphBackpressurePolicy.BlockUntilDrained"/>), a subscriber whose socket
+    /// buffer is full blocks this call until it drains or the write fails. Set
+    /// <see cref="BackpressurePolicy"/> to change that: <see cref="TelegraphBackpressurePolicy.DropForSlowSubscriber"/>
+    /// skips a subscriber whose buffer is already completely full rather than blocking, which
+    /// greatly reduces but does not eliminate the chance of this call blocking on it (see the
+    /// policy's own remarks), and <see cref="TelegraphBackpressurePolicy.DisconnectAfterTimeout"/>
+    /// bounds how long a write may block before that subscriber is disconnected. A subscriber
+    /// whose write throws (connection reset, buffer full past the policy's timeout) is dropped
+    /// silently rather than taking every other subscriber down with it.
     /// </remarks>
     public void Publish<T>(T message)
     {
@@ -137,6 +157,20 @@ public sealed class TelegraphPublisher : IDisposable
         {
             try
             {
+                if (BackpressurePolicy == TelegraphBackpressurePolicy.DropForSlowSubscriber
+                    && !subscriber.Client.Client.Poll(0, SelectMode.SelectWrite))
+                {
+                    continue;
+                }
+
+                // Set explicitly on every write, for every policy -- not only when entering
+                // DisconnectAfterTimeout -- so a socket that had a finite SendTimeout from an
+                // earlier policy gets it reset back to 0 (infinite) as soon as BackpressurePolicy
+                // changes away from DisconnectAfterTimeout, rather than keeping a stale timeout.
+                subscriber.Client.Client.SendTimeout = BackpressurePolicy == TelegraphBackpressurePolicy.DisconnectAfterTimeout
+                    ? (int)Math.Clamp(BackpressureTimeout.TotalMilliseconds, 1, int.MaxValue)
+                    : 0;
+
                 NetworkStream stream = subscriber.Client.GetStream();
                 stream.Write(bytes, 0, bytes.Length);
                 subscriber.Info.RecordSent(bytes.Length);
