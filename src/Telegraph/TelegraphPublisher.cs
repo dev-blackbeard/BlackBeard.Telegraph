@@ -3,7 +3,9 @@ using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -35,10 +37,19 @@ namespace Telegraph;
 /// in the remarks on <see cref="Publish{T}(T)"/>.
 /// </para>
 /// <para>
-/// Open to any connection by default. Pass a shared secret to the constructor to require a
-/// lightweight pre-shared-key handshake before a connection is added to the broadcast list -- see
-/// the constructor's remarks for the protocol and, importantly, what this does and does not
-/// protect against.
+/// Open to any connection, in plaintext, by default. Pass <see cref="SslServerAuthenticationOptions"/>
+/// to the constructor to require TLS instead: a connection whose handshake this publisher's own
+/// <c>AuthenticateAsServerAsync</c> step rejects (a protocol/cipher mismatch, a required client
+/// certificate that's missing) is dropped before it is ever added to the broadcast list, so it
+/// never receives a partial message and never counts toward <see cref="SubscriberCount"/>. A
+/// subscriber that locally distrusts this publisher's certificate is different: that handshake
+/// step can still complete on this side, since trust is the client's own decision and there's no
+/// protocol-level step where it reports that back -- that connection is cleaned up the same way
+/// any other dead one is, the next time <see cref="Publish{T}(T)"/> tries to write to it and
+/// fails. Alternatively, pass a shared secret to require a lightweight pre-shared-key handshake
+/// instead -- see that constructor's remarks for the protocol and, importantly, what it does and
+/// does not protect against. Either way, one slow or stalled handshake cannot hold up accepting
+/// anyone else.
 /// </para>
 /// </remarks>
 public sealed class TelegraphPublisher : IDisposable
@@ -52,6 +63,7 @@ public sealed class TelegraphPublisher : IDisposable
 
     private readonly TcpListener _listener;
     private readonly TelegraphFraming _framing;
+    private readonly SslServerAuthenticationOptions? _sslOptions;
     private readonly byte[]? _sharedSecret;
     private readonly List<ConnectedSubscriber> _clients = new List<ConnectedSubscriber>();
     private readonly object _clientsGate = new object();
@@ -60,8 +72,8 @@ public sealed class TelegraphPublisher : IDisposable
     private bool _disposed;
 
     /// <summary>
-    /// Creates a publisher bound to <see cref="IPAddress.Any"/> on a local port, open to any
-    /// connection, using <see cref="TelegraphFraming.NewlineDelimited"/> framing.
+    /// Creates a publisher bound to <see cref="IPAddress.Any"/> on a local port, in plaintext,
+    /// using <see cref="TelegraphFraming.NewlineDelimited"/> framing.
     /// </summary>
     /// <param name="port">The TCP port to listen on. Pass <c>0</c> to let the OS choose one; read it back from <see cref="Port"/> after <see cref="StartAsync(CancellationToken)"/>.</param>
     public TelegraphPublisher(int port)
@@ -70,8 +82,8 @@ public sealed class TelegraphPublisher : IDisposable
     }
 
     /// <summary>
-    /// Creates a publisher bound to a specific local address and port, open to any connection,
-    /// using <see cref="TelegraphFraming.NewlineDelimited"/> framing.
+    /// Creates a publisher bound to a specific local address and port, in plaintext, using
+    /// <see cref="TelegraphFraming.NewlineDelimited"/> framing.
     /// </summary>
     /// <param name="bindAddress">
     /// The local address to bind, e.g. <see cref="IPAddress.Loopback"/> to keep the publisher off
@@ -83,7 +95,7 @@ public sealed class TelegraphPublisher : IDisposable
     {
     }
 
-    /// <summary>Creates a publisher bound to <see cref="IPAddress.Any"/> on a local port, open to any connection, using the given wire framing.</summary>
+    /// <summary>Creates a publisher bound to <see cref="IPAddress.Any"/> on a local port, in plaintext, using the given wire framing.</summary>
     /// <param name="port">The TCP port to listen on. Pass <c>0</c> to let the OS choose one; read it back from <see cref="Port"/> after <see cref="StartAsync(CancellationToken)"/>.</param>
     /// <param name="framing">
     /// How messages are delimited on the wire. Every <see cref="TelegraphSubscriber"/> reading
@@ -95,7 +107,7 @@ public sealed class TelegraphPublisher : IDisposable
     {
     }
 
-    /// <summary>Creates a publisher bound to a specific local address and port, open to any connection, using the given wire framing.</summary>
+    /// <summary>Creates a publisher bound to a specific local address and port, in plaintext, using the given wire framing.</summary>
     /// <param name="bindAddress">
     /// The local address to bind, e.g. <see cref="IPAddress.Loopback"/> to keep the publisher off
     /// the network entirely, or one interface's address on a multi-homed host.
@@ -110,6 +122,23 @@ public sealed class TelegraphPublisher : IDisposable
     {
         _listener = new TcpListener(bindAddress, port);
         _framing = framing;
+    }
+
+    /// <summary>
+    /// Creates a publisher bound to <see cref="IPAddress.Any"/> on a local port, requiring TLS on
+    /// every connection, using <see cref="TelegraphFraming.NewlineDelimited"/> framing.
+    /// </summary>
+    /// <param name="port">The TCP port to listen on. Pass <c>0</c> to let the OS choose one; read it back from <see cref="Port"/> after <see cref="StartAsync(CancellationToken)"/>.</param>
+    /// <param name="sslOptions">
+    /// Server-side TLS options (certificate, protocols, client-certificate requirements). See the
+    /// remarks on <see cref="TelegraphPublisher"/> for exactly what completing this handshake
+    /// does and doesn't guarantee before a connection joins the broadcast list.
+    /// </param>
+    /// <exception cref="ArgumentNullException"><paramref name="sslOptions"/> is <c>null</c>.</exception>
+    public TelegraphPublisher(int port, SslServerAuthenticationOptions sslOptions)
+        : this(port)
+    {
+        _sslOptions = sslOptions ?? throw new ArgumentNullException(nameof(sslOptions));
     }
 
     /// <summary>
@@ -160,8 +189,8 @@ public sealed class TelegraphPublisher : IDisposable
     }
 
     /// <summary>
-    /// How many subscribers are currently connected -- and, when a shared secret is required,
-    /// have completed the handshake.
+    /// How many subscribers are currently connected -- and, when TLS or a shared secret is
+    /// required, have completed the handshake.
     /// </summary>
     public int SubscriberCount
     {
@@ -268,8 +297,7 @@ public sealed class TelegraphPublisher : IDisposable
                     ? (int)Math.Clamp(BackpressureTimeout.TotalMilliseconds, 1, int.MaxValue)
                     : 0;
 
-                NetworkStream stream = subscriber.Client.GetStream();
-                stream.Write(bytes, 0, bytes.Length);
+                subscriber.Stream.Write(bytes, 0, bytes.Length);
                 subscriber.Info.RecordSent(bytes.Length);
             }
             catch (IOException)
@@ -301,7 +329,7 @@ public sealed class TelegraphPublisher : IDisposable
 
             foreach (ConnectedSubscriber subscriber in dead)
             {
-                subscriber.Client.Dispose();
+                subscriber.Dispose();
             }
         }
     }
@@ -343,7 +371,7 @@ public sealed class TelegraphPublisher : IDisposable
             return false;
         }
 
-        match.Client.Dispose();
+        match.Dispose();
         return true;
     }
 
@@ -379,9 +407,18 @@ public sealed class TelegraphPublisher : IDisposable
                 break;
             }
 
+            if (_sslOptions != null)
+            {
+                // The TLS handshake runs on its own task rather than inline here, so a connection
+                // that stalls partway through it -- or never completes it at all -- cannot block
+                // this loop from accepting anyone else.
+                _ = CompleteTlsHandshakeAndRegisterAsync(client, cancellationToken);
+                continue;
+            }
+
             if (_sharedSecret != null)
             {
-                // The handshake runs on its own task rather than inline here, so a connection
+                // Same reasoning as the TLS handshake above: runs on its own task so a connection
                 // that never completes it cannot block this loop from accepting anyone else.
                 _ = CompletePreSharedKeyHandshakeAndRegisterAsync(client, cancellationToken);
                 continue;
@@ -398,7 +435,7 @@ public sealed class TelegraphPublisher : IDisposable
                 var info = new TelegraphSubscriberInfo((IPEndPoint)client.Client.RemoteEndPoint!, DateTimeOffset.UtcNow);
                 lock (_clientsGate)
                 {
-                    _clients.Add(new ConnectedSubscriber(client, info));
+                    _clients.Add(new ConnectedSubscriber(client, client.GetStream(), info));
                 }
             }
             catch (ObjectDisposedException)
@@ -412,12 +449,47 @@ public sealed class TelegraphPublisher : IDisposable
         }
     }
 
-    private async Task CompletePreSharedKeyHandshakeAndRegisterAsync(TcpClient client, CancellationToken cancellationToken)
+    private async Task CompleteTlsHandshakeAndRegisterAsync(TcpClient client, CancellationToken cancellationToken)
     {
+        var sslStream = new SslStream(client.GetStream(), leaveInnerStreamOpen: false);
         try
         {
-            NetworkStream stream = client.GetStream();
+            await sslStream.AuthenticateAsServerAsync(_sslOptions!, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or AuthenticationException or ObjectDisposedException or OperationCanceledException or SocketException)
+        {
+            sslStream.Dispose();
+            client.Dispose();
+            return;
+        }
 
+        // Same defensive handling as the plaintext path in AcceptLoopAsync: the handshake having
+        // just completed doesn't guarantee the socket is still usable by the time we get here.
+        try
+        {
+            var info = new TelegraphSubscriberInfo((IPEndPoint)client.Client.RemoteEndPoint!, DateTimeOffset.UtcNow);
+            lock (_clientsGate)
+            {
+                _clients.Add(new ConnectedSubscriber(client, sslStream, info));
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            sslStream.Dispose();
+            client.Dispose();
+        }
+        catch (SocketException)
+        {
+            sslStream.Dispose();
+            client.Dispose();
+        }
+    }
+
+    private async Task CompletePreSharedKeyHandshakeAndRegisterAsync(TcpClient client, CancellationToken cancellationToken)
+    {
+        NetworkStream stream = client.GetStream();
+        try
+        {
             var nonce = new byte[NonceSize];
             RandomNumberGenerator.Fill(nonce);
             await stream.WriteAsync(nonce, cancellationToken).ConfigureAwait(false);
@@ -450,7 +522,7 @@ public sealed class TelegraphPublisher : IDisposable
             var info = new TelegraphSubscriberInfo((IPEndPoint)client.Client.RemoteEndPoint!, DateTimeOffset.UtcNow);
             lock (_clientsGate)
             {
-                _clients.Add(new ConnectedSubscriber(client, info));
+                _clients.Add(new ConnectedSubscriber(client, stream, info));
             }
         }
         catch (ObjectDisposedException)
@@ -502,22 +574,31 @@ public sealed class TelegraphPublisher : IDisposable
 
         foreach (ConnectedSubscriber subscriber in snapshot)
         {
-            subscriber.Client.Dispose();
+            subscriber.Dispose();
         }
 
         _acceptLoopCancellation?.Dispose();
     }
 
-    private sealed class ConnectedSubscriber
+    private sealed class ConnectedSubscriber : IDisposable
     {
-        public ConnectedSubscriber(TcpClient client, TelegraphSubscriberInfo info)
+        public ConnectedSubscriber(TcpClient client, Stream stream, TelegraphSubscriberInfo info)
         {
             Client = client;
+            Stream = stream;
             Info = info;
         }
 
         public TcpClient Client { get; }
 
+        public Stream Stream { get; }
+
         public TelegraphSubscriberInfo Info { get; }
+
+        public void Dispose()
+        {
+            Stream.Dispose();
+            Client.Dispose();
+        }
     }
 }

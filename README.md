@@ -48,6 +48,33 @@ publisher and subscriber constructors instead: a 4-byte big-endian length prefix
 message rather than a trailing `\n`. It gives up `nc`-inspectability for immunity to that failure
 mode — pick whichever trade-off fits.
 
+## TLS
+
+Plaintext by default, matching the `nc`-inspectable quick start above. For anything crossing a
+network boundary that isn't already trusted, pass `SslServerAuthenticationOptions`/
+`SslClientAuthenticationOptions` to the publisher/subscriber constructors instead:
+
+```csharp
+using var publisher = new TelegraphPublisher(5000, new SslServerAuthenticationOptions
+{
+    ServerCertificate = myCertificate,
+});
+
+using var subscriber = new TelegraphSubscriber("localhost", 5000, new SslClientAuthenticationOptions
+{
+    TargetHost = "localhost",
+});
+```
+
+A connection whose handshake the publisher's own `AuthenticateAsServerAsync` step rejects (a
+protocol/cipher mismatch, a required client certificate that's missing) is dropped before it is
+ever added to the broadcast list, so it never receives a partial message and never counts toward
+`SubscriberCount`. A subscriber that locally distrusts the publisher's certificate is a different
+case: from the publisher's side that handshake step can still complete, since trust is the
+client's own decision to make and there's no protocol-level step where it reports that decision
+back — that connection is cleaned up the same way any other dead one is, the next time `Publish`
+tries to write to it and fails.
+
 ## Pre-shared-key handshake
 
 Open to any connection by default. For "don't let an arbitrary process on this host or LAN
