@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -36,17 +37,19 @@ namespace Telegraph;
 /// in the remarks on <see cref="Publish{T}(T)"/>.
 /// </para>
 /// <para>
-/// The connection is plaintext by default -- the right trade-off for the zero-setup, <c>nc</c>-inspectable
-/// quick start. Pass <see cref="SslServerAuthenticationOptions"/> to the constructor to require
-/// TLS instead: a connection whose handshake this publisher's own <c>AuthenticateAsServerAsync</c>
-/// step rejects (a protocol/cipher mismatch, a required client certificate that's missing) is
-/// dropped before it is ever added to the broadcast list, so it never receives a partial message
-/// and never counts toward <see cref="SubscriberCount"/>. A subscriber that locally distrusts this
-/// publisher's certificate is different: that handshake step can still complete on this side,
-/// since trust is the client's own decision and there's no protocol-level step where it reports
-/// that back -- that connection is cleaned up the same way any other dead one is, the next time
-/// <see cref="Publish{T}(T)"/> tries to write to it and fails. Either way, one slow or stalled
-/// handshake cannot hold up accepting anyone else.
+/// Open to any connection, in plaintext, by default. Pass <see cref="SslServerAuthenticationOptions"/>
+/// to the constructor to require TLS instead: a connection whose handshake this publisher's own
+/// <c>AuthenticateAsServerAsync</c> step rejects (a protocol/cipher mismatch, a required client
+/// certificate that's missing) is dropped before it is ever added to the broadcast list, so it
+/// never receives a partial message and never counts toward <see cref="SubscriberCount"/>. A
+/// subscriber that locally distrusts this publisher's certificate is different: that handshake
+/// step can still complete on this side, since trust is the client's own decision and there's no
+/// protocol-level step where it reports that back -- that connection is cleaned up the same way
+/// any other dead one is, the next time <see cref="Publish{T}(T)"/> tries to write to it and
+/// fails. Alternatively, pass a shared secret to require a lightweight pre-shared-key handshake
+/// instead -- see that constructor's remarks for the protocol and, importantly, what it does and
+/// does not protect against. Either way, one slow or stalled handshake cannot hold up accepting
+/// anyone else.
 /// </para>
 /// <para>
 /// Accepts a connection from any address by default. Add to <see cref="AllowedRanges"/> -- before
@@ -58,6 +61,8 @@ namespace Telegraph;
 /// </remarks>
 public sealed class TelegraphPublisher : IDisposable
 {
+    private const int NonceSize = 32;
+
     private static readonly JsonSerializerOptions JsonOptions = new JsonSerializerOptions
     {
         PropertyNameCaseInsensitive = true,
@@ -66,6 +71,7 @@ public sealed class TelegraphPublisher : IDisposable
     private readonly TcpListener _listener;
     private readonly TelegraphFraming _framing;
     private readonly SslServerAuthenticationOptions? _sslOptions;
+    private readonly byte[]? _sharedSecret;
     private readonly List<ConnectedSubscriber> _clients = new List<ConnectedSubscriber>();
     private readonly object _clientsGate = new object();
     private CancellationTokenSource? _acceptLoopCancellation;
@@ -142,6 +148,47 @@ public sealed class TelegraphPublisher : IDisposable
         _sslOptions = sslOptions ?? throw new ArgumentNullException(nameof(sslOptions));
     }
 
+    /// <summary>
+    /// Creates a publisher bound to <see cref="IPAddress.Any"/> on a local port, requiring a
+    /// pre-shared-key handshake on every connection, using
+    /// <see cref="TelegraphFraming.NewlineDelimited"/> framing.
+    /// </summary>
+    /// <param name="port">The TCP port to listen on. Pass <c>0</c> to let the OS choose one; read it back from <see cref="Port"/> after <see cref="StartAsync(CancellationToken)"/>.</param>
+    /// <param name="sharedSecret">
+    /// The secret this publisher and every <see cref="TelegraphSubscriber"/> connecting to it must
+    /// agree on out of band. Must not be null or empty.
+    /// </param>
+    /// <exception cref="ArgumentException"><paramref name="sharedSecret"/> is null or empty.</exception>
+    /// <remarks>
+    /// <para>
+    /// On connect, this publisher sends a random 32-byte nonce, then expects back the HMAC-SHA256
+    /// of that nonce keyed with <paramref name="sharedSecret"/>, computed the same way a
+    /// <see cref="TelegraphSubscriber"/> constructed with the matching secret computes it. A
+    /// response that doesn't match -- including no response at all before the connection drops --
+    /// closes the connection immediately, before it is added to the broadcast list and before any
+    /// application data is exchanged. The handshake runs on its own task per connection, so one
+    /// that never completes it cannot block accepting anyone else.
+    /// </para>
+    /// <para>
+    /// This is explicitly not a substitute for TLS: it authenticates the connection, proving the
+    /// other side knows the secret, but the stream itself stays plaintext -- everything after the
+    /// handshake, including the secret's role in it, is visible to anyone who can observe the
+    /// wire. For a caller that just wants "don't let an arbitrary process on this host or LAN
+    /// subscribe to my stream" without provisioning PKI, that trade-off is often fine; it is not a
+    /// substitute for TLS where the network itself isn't trusted.
+    /// </para>
+    /// </remarks>
+    public TelegraphPublisher(int port, string sharedSecret)
+        : this(port)
+    {
+        if (string.IsNullOrEmpty(sharedSecret))
+        {
+            throw new ArgumentException("Shared secret must not be null or empty.", nameof(sharedSecret));
+        }
+
+        _sharedSecret = Encoding.UTF8.GetBytes(sharedSecret);
+    }
+
     /// <summary>The port actually bound. Only meaningful after <see cref="StartAsync(CancellationToken)"/> has returned.</summary>
     public int Port
     {
@@ -158,8 +205,8 @@ public sealed class TelegraphPublisher : IDisposable
     public ICollection<IPNetwork> AllowedRanges { get; } = new List<IPNetwork>();
 
     /// <summary>
-    /// How many subscribers are currently connected -- and, when TLS is required, have completed
-    /// the handshake.
+    /// How many subscribers are currently connected -- and, when TLS or a shared secret is
+    /// required, have completed the handshake.
     /// </summary>
     public int SubscriberCount
     {
@@ -408,6 +455,14 @@ public sealed class TelegraphPublisher : IDisposable
                 continue;
             }
 
+            if (_sharedSecret != null)
+            {
+                // Same reasoning as the TLS handshake above: runs on its own task so a connection
+                // that never completes it cannot block this loop from accepting anyone else.
+                _ = CompletePreSharedKeyHandshakeAndRegisterAsync(client, cancellationToken);
+                continue;
+            }
+
             // Same defensive handling as the IsAllowed check above: a client that connects and
             // drops immediately can make RemoteEndPoint throw here too, and that must not escape
             // this loop either.
@@ -483,6 +538,73 @@ public sealed class TelegraphPublisher : IDisposable
             sslStream.Dispose();
             client.Dispose();
         }
+    }
+
+    private async Task CompletePreSharedKeyHandshakeAndRegisterAsync(TcpClient client, CancellationToken cancellationToken)
+    {
+        NetworkStream stream = client.GetStream();
+        try
+        {
+            var nonce = new byte[NonceSize];
+            RandomNumberGenerator.Fill(nonce);
+            await stream.WriteAsync(nonce, cancellationToken).ConfigureAwait(false);
+
+            byte[] expected;
+            using (var hmac = new HMACSHA256(_sharedSecret!))
+            {
+                expected = hmac.ComputeHash(nonce);
+            }
+
+            var actual = new byte[expected.Length];
+            bool gotResponse = await ReadFullyAsync(stream, actual, actual.Length, cancellationToken).ConfigureAwait(false);
+
+            if (!gotResponse || !CryptographicOperations.FixedTimeEquals(actual, expected))
+            {
+                client.Dispose();
+                return;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or SocketException or OperationCanceledException)
+        {
+            client.Dispose();
+            return;
+        }
+
+        // Same defensive handling as the plaintext path in AcceptLoopAsync: a successful handshake
+        // doesn't guarantee the socket is still usable by the time we get here.
+        try
+        {
+            var info = new TelegraphSubscriberInfo((IPEndPoint)client.Client.RemoteEndPoint!, DateTimeOffset.UtcNow);
+            lock (_clientsGate)
+            {
+                _clients.Add(new ConnectedSubscriber(client, stream, info));
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            client.Dispose();
+        }
+        catch (SocketException)
+        {
+            client.Dispose();
+        }
+    }
+
+    private static async Task<bool> ReadFullyAsync(Stream stream, byte[] buffer, int count, CancellationToken cancellationToken)
+    {
+        int offset = 0;
+        while (offset < count)
+        {
+            int read = await stream.ReadAsync(buffer.AsMemory(offset, count - offset), cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+            {
+                return false;
+            }
+
+            offset += read;
+        }
+
+        return true;
     }
 
     /// <summary>Stops listening, disconnects every subscriber, and releases the port.</summary>
