@@ -2,6 +2,7 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -40,12 +41,13 @@ public sealed class TelegraphSubscriber : IDisposable
     private readonly string _host;
     private readonly int _port;
     private readonly TelegraphFraming _framing;
+    private readonly SslClientAuthenticationOptions? _sslOptions;
     private TcpClient? _client;
-    private NetworkStream? _stream;
+    private Stream? _stream;
     private StreamReader? _reader;
     private bool _disposed;
 
-    /// <summary>Creates a subscriber using <see cref="TelegraphFraming.NewlineDelimited"/> framing. Call <see cref="ConnectAsync(CancellationToken)"/> before reading.</summary>
+    /// <summary>Creates a subscriber that connects in plaintext, using <see cref="TelegraphFraming.NewlineDelimited"/> framing. Call <see cref="ConnectAsync(CancellationToken)"/> before reading.</summary>
     /// <param name="host">The publisher's host name or address.</param>
     /// <param name="port">The publisher's port.</param>
     /// <exception cref="ArgumentNullException"><paramref name="host"/> is <c>null</c>.</exception>
@@ -54,7 +56,7 @@ public sealed class TelegraphSubscriber : IDisposable
     {
     }
 
-    /// <summary>Creates a subscriber. Call <see cref="ConnectAsync(CancellationToken)"/> before reading.</summary>
+    /// <summary>Creates a subscriber that connects in plaintext, using the given wire framing. Call <see cref="ConnectAsync(CancellationToken)"/> before reading.</summary>
     /// <param name="host">The publisher's host name or address.</param>
     /// <param name="port">The publisher's port.</param>
     /// <param name="framing">
@@ -75,6 +77,24 @@ public sealed class TelegraphSubscriber : IDisposable
         _framing = framing;
     }
 
+    /// <summary>
+    /// Creates a subscriber that requires TLS, using <see cref="TelegraphFraming.NewlineDelimited"/>
+    /// framing. Call <see cref="ConnectAsync(CancellationToken)"/> before reading.
+    /// </summary>
+    /// <param name="host">The publisher's host name or address.</param>
+    /// <param name="port">The publisher's port.</param>
+    /// <param name="sslOptions">
+    /// Client-side TLS options (target host, certificate validation, client certificates). Must
+    /// pair with a <see cref="TelegraphPublisher"/> constructed with <see cref="System.Net.Security.SslServerAuthenticationOptions"/>
+    /// -- there is nothing on the wire that identifies whether TLS is expected.
+    /// </param>
+    /// <exception cref="ArgumentNullException"><paramref name="host"/> or <paramref name="sslOptions"/> is <c>null</c>.</exception>
+    public TelegraphSubscriber(string host, int port, SslClientAuthenticationOptions sslOptions)
+        : this(host, port, TelegraphFraming.NewlineDelimited)
+    {
+        _sslOptions = sslOptions ?? throw new ArgumentNullException(nameof(sslOptions));
+    }
+
     /// <summary><c>true</c> once <see cref="ConnectAsync(CancellationToken)"/> has completed successfully.</summary>
     public bool IsConnected
     {
@@ -82,18 +102,40 @@ public sealed class TelegraphSubscriber : IDisposable
     }
 
     /// <summary>Opens the connection to the publisher.</summary>
-    /// <param name="cancellationToken">Cancels the connection attempt.</param>
+    /// <param name="cancellationToken">Cancels the connection attempt, and the TLS handshake if one is required.</param>
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
     {
         var client = new TcpClient();
         await client.ConnectAsync(_host, _port, cancellationToken).ConfigureAwait(false);
 
+        Stream stream = client.GetStream();
+        if (_sslOptions != null)
+        {
+            var sslStream = new SslStream(stream, leaveInnerStreamOpen: false);
+            bool authenticated = false;
+            try
+            {
+                await sslStream.AuthenticateAsClientAsync(_sslOptions, cancellationToken).ConfigureAwait(false);
+                authenticated = true;
+            }
+            finally
+            {
+                if (!authenticated)
+                {
+                    sslStream.Dispose();
+                    client.Dispose();
+                }
+            }
+
+            stream = sslStream;
+        }
+
         _client = client;
-        _stream = client.GetStream();
+        _stream = stream;
 
         if (_framing == TelegraphFraming.NewlineDelimited)
         {
-            _reader = new StreamReader(_stream, Encoding.UTF8);
+            _reader = new StreamReader(stream, Encoding.UTF8);
         }
     }
 
@@ -204,7 +246,12 @@ public sealed class TelegraphSubscriber : IDisposable
         }
 
         _disposed = true;
+
+        // _reader (when set) owns and disposes _stream itself; disposing _stream too is only
+        // needed for the LengthPrefixed path, where there is no _reader wrapping it. Stream
+        // disposal is idempotent, so covering both here is safe either way.
         _reader?.Dispose();
+        _stream?.Dispose();
         _client?.Dispose();
     }
 
