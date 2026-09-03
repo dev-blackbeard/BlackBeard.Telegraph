@@ -44,11 +44,22 @@ public sealed class TelegraphPublisher : IDisposable
     private Task? _acceptLoopTask;
     private bool _disposed;
 
-    /// <summary>Creates a publisher bound to a local port.</summary>
+    /// <summary>Creates a publisher bound to <see cref="IPAddress.Any"/> on a local port.</summary>
     /// <param name="port">The TCP port to listen on. Pass <c>0</c> to let the OS choose one; read it back from <see cref="Port"/> after <see cref="StartAsync(CancellationToken)"/>.</param>
     public TelegraphPublisher(int port)
+        : this(IPAddress.Any, port)
     {
-        _listener = new TcpListener(IPAddress.Any, port);
+    }
+
+    /// <summary>Creates a publisher bound to a specific local address and port.</summary>
+    /// <param name="bindAddress">
+    /// The local address to bind, e.g. <see cref="IPAddress.Loopback"/> to keep the publisher off
+    /// the network entirely, or one interface's address on a multi-homed host.
+    /// </param>
+    /// <param name="port">The TCP port to listen on. Pass <c>0</c> to let the OS choose one; read it back from <see cref="Port"/> after <see cref="StartAsync(CancellationToken)"/>.</param>
+    public TelegraphPublisher(IPAddress bindAddress, int port)
+    {
+        _listener = new TcpListener(bindAddress, port);
     }
 
     /// <summary>The port actually bound. Only meaningful after <see cref="StartAsync(CancellationToken)"/> has returned.</summary>
