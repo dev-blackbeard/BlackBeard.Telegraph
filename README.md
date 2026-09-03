@@ -131,6 +131,60 @@ framing to worry about. No reliability, ordering, or delivery guarantees of any 
 trade for reaching past TCP. A message over roughly 1472 bytes (`TelegraphUdpPublisher.MaxDatagramSize`)
 throws on `Publish` instead of being silently fragmented by the OS.
 
+## Bind address
+
+Binds to `IPAddress.Any` (every interface) by default. To keep the publisher off the network
+entirely, or to pick one interface on a multi-homed host, pass a bind address explicitly:
+
+```csharp
+using var publisher = new TelegraphPublisher(IPAddress.Loopback, 5000);
+```
+
+This overload composes with the framing, TLS, and pre-shared-key constructors above — it's the
+same `bindAddress` parameter on each of them.
+
+## Subscriber visibility
+
+`SubscriberCount` is a number; `Subscribers` is the list behind it — one `TelegraphSubscriberInfo`
+per connection, with `RemoteEndPoint`, `ConnectedAt`, `BytesSent`, and `MessagesSent`:
+
+```csharp
+foreach (TelegraphSubscriberInfo subscriber in publisher.Subscribers)
+{
+    Console.WriteLine($"{subscriber.RemoteEndPoint} connected {subscriber.ConnectedAt}, " +
+        $"{subscriber.MessagesSent} messages / {subscriber.BytesSent} bytes sent");
+}
+```
+
+Pass one of those back to `Disconnect` to drop just that subscriber, without affecting anyone else
+or the publisher itself:
+
+```csharp
+publisher.Disconnect(subscriber);
+```
+
+`Disconnect` returns `false` rather than throwing if that subscriber had already disconnected on
+its own (e.g. a dead connection cleaned up during a prior `Publish`) — there's nothing left to do.
+
+## Backpressure policy
+
+`Publish` blocks until a slow subscriber's socket buffer drains by default — the original
+behaviour, and still the right one when losing a message is worse than a little latency. Set
+`BackpressurePolicy` for a different trade-off:
+
+```csharp
+using var publisher = new TelegraphPublisher(5000)
+{
+    BackpressurePolicy = TelegraphBackpressurePolicy.DropForSlowSubscriber,
+};
+```
+
+- `BlockUntilDrained` (the default): waits for the write to complete, however long that takes.
+- `DropForSlowSubscriber`: skips a subscriber whose buffer is already full for that one message
+  rather than blocking `Publish`, and keeps it connected for later messages.
+- `DisconnectAfterTimeout`: bounds how long a write may block, via `BackpressureTimeout` (default
+  30 seconds), before dropping that subscriber the same way any other dead connection is dropped.
+
 ## `Pose6Dof` and `TelegraphEnvelope`
 
 An opt-in message shape for 6DOF-plus-metadata streams, so that use case doesn't require designing
