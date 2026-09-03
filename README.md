@@ -42,6 +42,12 @@ Newline-delimited UTF-8 JSON: one message per line, on a plain TCP stream. No fr
 newline, no handshake, no compression. Inspectable with `nc localhost 5000`. A late-connecting
 subscriber only sees messages published after it connects — there is no replay buffer.
 
+This is the default (`TelegraphFraming.NewlineDelimited`), not the only option. If a message's
+JSON could ever contain a raw newline byte, pass `TelegraphFraming.LengthPrefixed` to both the
+publisher and subscriber constructors instead: a 4-byte big-endian length prefix ahead of each
+message rather than a trailing `\n`. It gives up `nc`-inspectability for immunity to that failure
+mode — pick whichever trade-off fits.
+
 ## `Pose6Dof` and `TelegraphEnvelope`
 
 An opt-in message shape for 6DOF-plus-metadata streams, so that use case doesn't require designing
