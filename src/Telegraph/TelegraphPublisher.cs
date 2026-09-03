@@ -38,7 +38,7 @@ public sealed class TelegraphPublisher : IDisposable
     };
 
     private readonly TcpListener _listener;
-    private readonly List<TcpClient> _clients = new List<TcpClient>();
+    private readonly List<ConnectedSubscriber> _clients = new List<ConnectedSubscriber>();
     private readonly object _clientsGate = new object();
     private CancellationTokenSource? _acceptLoopCancellation;
     private Task? _acceptLoopTask;
@@ -80,6 +80,26 @@ public sealed class TelegraphPublisher : IDisposable
         }
     }
 
+    /// <summary>
+    /// The subscribers currently connected: a snapshot at the moment of the call, not a live view.
+    /// </summary>
+    public IReadOnlyList<TelegraphSubscriberInfo> Subscribers
+    {
+        get
+        {
+            lock (_clientsGate)
+            {
+                var infos = new List<TelegraphSubscriberInfo>(_clients.Count);
+                foreach (ConnectedSubscriber subscriber in _clients)
+                {
+                    infos.Add(subscriber.Info);
+                }
+
+                return infos;
+            }
+        }
+    }
+
     /// <summary>Starts listening for subscribers.</summary>
     /// <param name="cancellationToken">Stops accepting new subscribers when cancelled. Already-connected subscribers are unaffected.</param>
     public Task StartAsync(CancellationToken cancellationToken = default)
@@ -106,34 +126,35 @@ public sealed class TelegraphPublisher : IDisposable
     {
         byte[] bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message, JsonOptions) + "\n");
 
-        List<TcpClient> snapshot;
+        List<ConnectedSubscriber> snapshot;
         lock (_clientsGate)
         {
-            snapshot = new List<TcpClient>(_clients);
+            snapshot = new List<ConnectedSubscriber>(_clients);
         }
 
-        List<TcpClient>? dead = null;
-        foreach (TcpClient client in snapshot)
+        List<ConnectedSubscriber>? dead = null;
+        foreach (ConnectedSubscriber subscriber in snapshot)
         {
             try
             {
-                NetworkStream stream = client.GetStream();
+                NetworkStream stream = subscriber.Client.GetStream();
                 stream.Write(bytes, 0, bytes.Length);
+                subscriber.Info.RecordSent(bytes.Length);
             }
             catch (IOException)
             {
-                dead ??= new List<TcpClient>();
-                dead.Add(client);
+                dead ??= new List<ConnectedSubscriber>();
+                dead.Add(subscriber);
             }
             catch (ObjectDisposedException)
             {
-                dead ??= new List<TcpClient>();
-                dead.Add(client);
+                dead ??= new List<ConnectedSubscriber>();
+                dead.Add(subscriber);
             }
             catch (SocketException)
             {
-                dead ??= new List<TcpClient>();
-                dead.Add(client);
+                dead ??= new List<ConnectedSubscriber>();
+                dead.Add(subscriber);
             }
         }
 
@@ -141,17 +162,58 @@ public sealed class TelegraphPublisher : IDisposable
         {
             lock (_clientsGate)
             {
-                foreach (TcpClient client in dead)
+                foreach (ConnectedSubscriber subscriber in dead)
                 {
-                    _clients.Remove(client);
+                    _clients.Remove(subscriber);
                 }
             }
 
-            foreach (TcpClient client in dead)
+            foreach (ConnectedSubscriber subscriber in dead)
             {
-                client.Dispose();
+                subscriber.Client.Dispose();
             }
         }
+    }
+
+    /// <summary>
+    /// Disconnects one subscriber without affecting any other, or the publisher itself.
+    /// </summary>
+    /// <param name="subscriber">A <see cref="TelegraphSubscriberInfo"/> obtained from <see cref="Subscribers"/>.</param>
+    /// <returns>
+    /// <see langword="true"/> if the subscriber was connected and has now been disconnected;
+    /// <see langword="false"/> if it had already disconnected on its own (e.g. a dead connection
+    /// dropped during <see cref="Publish{T}(T)"/>), in which case there is nothing left to do.
+    /// </returns>
+    public bool Disconnect(TelegraphSubscriberInfo subscriber)
+    {
+        ConnectedSubscriber? match = null;
+        lock (_clientsGate)
+        {
+            foreach (ConnectedSubscriber candidate in _clients)
+            {
+                if (ReferenceEquals(candidate.Info, subscriber))
+                {
+                    match = candidate;
+                    break;
+                }
+            }
+
+            // Removed after the loop, not inside it -- mutating _clients mid-enumeration only
+            // happened to be safe here because the break on the line above meant MoveNext() was
+            // never called again; find-then-remove doesn't depend on that.
+            if (match != null)
+            {
+                _clients.Remove(match);
+            }
+        }
+
+        if (match == null)
+        {
+            return false;
+        }
+
+        match.Client.Dispose();
+        return true;
     }
 
     private async Task AcceptLoopAsync(CancellationToken cancellationToken)
@@ -176,9 +238,27 @@ public sealed class TelegraphPublisher : IDisposable
                 break;
             }
 
-            lock (_clientsGate)
+            // A client that connects and drops immediately (a port scanner, a health check, a
+            // load-balancer probe) can make RemoteEndPoint throw on the now-defunct socket. That
+            // must not escape this loop -- an unhandled exception here would fault AcceptLoopAsync
+            // and permanently stop the publisher from accepting any further subscribers, with
+            // nothing surfaced anywhere. Treat it the same as any other subscriber that never made
+            // it: skip it and keep accepting.
+            try
             {
-                _clients.Add(client);
+                var info = new TelegraphSubscriberInfo((IPEndPoint)client.Client.RemoteEndPoint!, DateTimeOffset.UtcNow);
+                lock (_clientsGate)
+                {
+                    _clients.Add(new ConnectedSubscriber(client, info));
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                client.Dispose();
+            }
+            catch (SocketException)
+            {
+                client.Dispose();
             }
         }
     }
@@ -196,18 +276,31 @@ public sealed class TelegraphPublisher : IDisposable
         _acceptLoopCancellation?.Cancel();
         _listener.Stop();
 
-        List<TcpClient> snapshot;
+        List<ConnectedSubscriber> snapshot;
         lock (_clientsGate)
         {
-            snapshot = new List<TcpClient>(_clients);
+            snapshot = new List<ConnectedSubscriber>(_clients);
             _clients.Clear();
         }
 
-        foreach (TcpClient client in snapshot)
+        foreach (ConnectedSubscriber subscriber in snapshot)
         {
-            client.Dispose();
+            subscriber.Client.Dispose();
         }
 
         _acceptLoopCancellation?.Dispose();
+    }
+
+    private sealed class ConnectedSubscriber
+    {
+        public ConnectedSubscriber(TcpClient client, TelegraphSubscriberInfo info)
+        {
+            Client = client;
+            Info = info;
+        }
+
+        public TcpClient Client { get; }
+
+        public TelegraphSubscriberInfo Info { get; }
     }
 }
