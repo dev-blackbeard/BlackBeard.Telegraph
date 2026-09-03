@@ -122,6 +122,26 @@ public sealed class RoundTripTests
     }
 
     [Fact]
+    public async Task PublisherCanBindToLoopbackExplicitly()
+    {
+        using var publisher = new TelegraphPublisher(System.Net.IPAddress.Loopback, 0);
+        await publisher.StartAsync();
+
+        using var subscriber = new TelegraphSubscriber("127.0.0.1", publisher.Port);
+        await subscriber.ConnectAsync();
+        await WaitForSubscriberCountAsync(publisher, 1);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        Task<TelegraphEnvelope> readTask = ReadOneAsync<TelegraphEnvelope>(subscriber, cts.Token);
+
+        publisher.Publish(new TelegraphEnvelope("loopback", DateTimeOffset.UtcNow));
+
+        TelegraphEnvelope received = await readTask;
+
+        Assert.Equal("loopback", received.EntityId);
+    }
+
+    [Fact]
     public async Task SubscribersExposesRemoteEndPointAndSentCounters()
     {
         using var publisher = new TelegraphPublisher(0);
