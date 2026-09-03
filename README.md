@@ -75,6 +75,21 @@ client's own decision to make and there's no protocol-level step where it report
 back — that connection is cleaned up the same way any other dead one is, the next time `Publish`
 tries to write to it and fails.
 
+## Pre-shared-key handshake
+
+Open to any connection by default. For "don't let an arbitrary process on this host or LAN
+subscribe to my stream" without provisioning PKI, pass a shared secret to both constructors:
+
+```csharp
+using var publisher = new TelegraphPublisher(5000, "correct-horse-battery-staple");
+using var subscriber = new TelegraphSubscriber("localhost", 5000, "correct-horse-battery-staple");
+```
+
+The subscriber proves it knows the secret (a keyed hash of a publisher-issued nonce) before it's
+added to the broadcast list; a mismatch closes the connection immediately, before any application
+data is exchanged. This authenticates the connection, not the transport — the stream itself stays
+plaintext, so it is not a substitute for TLS where the network itself isn't trusted.
+
 ## UDP transport
 
 For high-rate telemetry where a dropped packet beats head-of-line blocking, or a subscriber that
