@@ -90,6 +90,23 @@ added to the broadcast list; a mismatch closes the connection immediately, befor
 data is exchanged. This authenticates the connection, not the transport — the stream itself stays
 plaintext, so it is not a substitute for TLS where the network itself isn't trusted.
 
+## CIDR allow-list
+
+Accepts a connection from any address by default. For "only this /24 may subscribe" without
+standing up firewall rules per-process, add to `AllowedRanges`:
+
+```csharp
+using var publisher = new TelegraphPublisher(5000)
+{
+    AllowedRanges = { IPNetwork.Parse("10.0.0.0/24") },
+};
+```
+
+A connection from outside every configured range is closed immediately after being accepted,
+before it's added to the broadcast list — it never receives a partial message and never counts
+toward `SubscriberCount`. Populate it before calling `StartAsync`; it's read without
+synchronisation while the accept loop is running.
+
 ## UDP transport
 
 For high-rate telemetry where a dropped packet beats head-of-line blocking, or a subscriber that

@@ -51,6 +51,13 @@ namespace Telegraph;
 /// does not protect against. Either way, one slow or stalled handshake cannot hold up accepting
 /// anyone else.
 /// </para>
+/// <para>
+/// Accepts a connection from any address by default. Add to <see cref="AllowedRanges"/> -- before
+/// <see cref="StartAsync(CancellationToken)"/>, since it is read without synchronisation while the
+/// accept loop is running -- to restrict that: a connection from outside every configured range is
+/// closed immediately after being accepted, before it is added to the broadcast list, so it never
+/// receives a partial message and never counts toward <see cref="SubscriberCount"/>.
+/// </para>
 /// </remarks>
 public sealed class TelegraphPublisher : IDisposable
 {
@@ -187,6 +194,15 @@ public sealed class TelegraphPublisher : IDisposable
     {
         get { return ((IPEndPoint)_listener.LocalEndpoint).Port; }
     }
+
+    /// <summary>
+    /// CIDR ranges a connection's remote address must fall within to be accepted. Empty (the
+    /// default) means no restriction, matching the behaviour of every <see cref="TelegraphPublisher"/>
+    /// before this property existed. Populate it (e.g. via an object initializer) before calling
+    /// <see cref="StartAsync(CancellationToken)"/> -- the accept loop reads it without taking a
+    /// lock, so mutating it concurrently with a running loop is not supported.
+    /// </summary>
+    public ICollection<IPNetwork> AllowedRanges { get; } = new List<IPNetwork>();
 
     /// <summary>
     /// How many subscribers are currently connected -- and, when TLS or a shared secret is
@@ -407,6 +423,29 @@ public sealed class TelegraphPublisher : IDisposable
                 break;
             }
 
+            bool allowed;
+            try
+            {
+                allowed = IsAllowed(client);
+            }
+            catch (ObjectDisposedException)
+            {
+                // The connection dropped between being accepted and being checked (a port
+                // scanner, a health check, a load-balancer probe) -- treat it the same as a
+                // disallowed one rather than letting it escape and kill the accept loop.
+                allowed = false;
+            }
+            catch (SocketException)
+            {
+                allowed = false;
+            }
+
+            if (!allowed)
+            {
+                client.Dispose();
+                continue;
+            }
+
             if (_sslOptions != null)
             {
                 // The TLS handshake runs on its own task rather than inline here, so a connection
@@ -424,12 +463,9 @@ public sealed class TelegraphPublisher : IDisposable
                 continue;
             }
 
-            // A client that connects and drops immediately (a port scanner, a health check, a
-            // load-balancer probe) can make RemoteEndPoint throw on the now-defunct socket. That
-            // must not escape this loop -- an unhandled exception here would fault AcceptLoopAsync
-            // and permanently stop the publisher from accepting any further subscribers, with
-            // nothing surfaced anywhere. Treat it the same as any other subscriber that never made
-            // it: skip it and keep accepting.
+            // Same defensive handling as the IsAllowed check above: a client that connects and
+            // drops immediately can make RemoteEndPoint throw here too, and that must not escape
+            // this loop either.
             try
             {
                 var info = new TelegraphSubscriberInfo((IPEndPoint)client.Client.RemoteEndPoint!, DateTimeOffset.UtcNow);
@@ -447,6 +483,25 @@ public sealed class TelegraphPublisher : IDisposable
                 client.Dispose();
             }
         }
+    }
+
+    private bool IsAllowed(TcpClient client)
+    {
+        if (AllowedRanges.Count == 0)
+        {
+            return true;
+        }
+
+        var remoteEndPoint = (IPEndPoint)client.Client.RemoteEndPoint!;
+        foreach (IPNetwork range in AllowedRanges)
+        {
+            if (range.Contains(remoteEndPoint.Address))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private async Task CompleteTlsHandshakeAndRegisterAsync(TcpClient client, CancellationToken cancellationToken)
